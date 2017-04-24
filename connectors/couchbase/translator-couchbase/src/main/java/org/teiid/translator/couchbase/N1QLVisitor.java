@@ -168,6 +168,16 @@ public class N1QLVisitor extends SQLStringVisitor{
         isUnrelatedColumns = false;
         
     }
+    
+    @Override
+    public void visit(AndOr obj) {
+        String opString = obj.getOperator().toString();
+        appendNestedCondition(obj, obj.getLeftCondition());
+        if(!isUnrelatedColumns) {
+            buffer.append(Tokens.SPACE).append(opString).append(Tokens.SPACE);
+        }
+        appendNestedCondition(obj, obj.getRightCondition());
+    }
 
     private void appendWhere(Select obj) {
         

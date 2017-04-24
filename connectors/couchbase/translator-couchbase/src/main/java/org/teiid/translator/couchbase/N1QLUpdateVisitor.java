@@ -302,7 +302,7 @@ public class N1QLUpdateVisitor extends N1QLVisitor {
         } else {       
             buffer.append(DELETE).append(SPACE).append(FROM).append(SPACE);
             buffer.append(this.keyspace);
-            appendClauses(rowCache, conditions, null);
+//            appendClauses(rowCache, conditions, null); //TODO--
         }
     }
 
@@ -335,6 +335,44 @@ public class N1QLUpdateVisitor extends N1QLVisitor {
         return conditions;
     }
     
+    private List<String> andOrStack;
+    
+    private List<String> getAndOrStack() {
+        return this.andOrStack;
+    }
+    
+    private void addAndOr(String andOr) {
+        if(this.andOrStack == null) {
+            this.andOrStack = new ArrayList<>();
+        }
+        this.andOrStack.add(andOr);
+    }
+    
+    private void findAllPredicates(Condition c, List<CBColumnData> rowCache) {
+        if (c instanceof Comparison) {
+            appendComparison((Comparison)c, rowCache);
+        } else if (c instanceof AndOr) {
+            appendAndOr((AndOr)c, rowCache);
+        }
+    }
+    
+    private void appendAndOr(AndOr obj, List<CBColumnData> rowCache) {
+        findAllPredicates(obj.getLeftCondition(), rowCache);
+        addAndOr(obj.getOperator().toString());
+        findAllPredicates(obj.getRightCondition(), rowCache);
+    }
+    
+    private void appendComparison(Comparison comp, List<CBColumnData> rowCache) {
+        if(comp.getLeftExpression() instanceof ColumnReference) {
+            ColumnReference col =  (ColumnReference) comp.getLeftExpression();
+            CBColumn column = formCBColumn(col);
+            CBColumnData cacheData = new CBColumnData(col.getType(), column);
+            cacheData.setOperator(comp.getOperator().toString());
+            cacheData.setValue(((Literal)comp.getRightExpression()).getValue());
+            rowCache.add(cacheData);
+        }
+    }
+    
     private String getValueString(Class<?> type, Object value) {
         if (value == null) {
             return null;
@@ -359,12 +397,9 @@ public class N1QLUpdateVisitor extends N1QLVisitor {
         Condition where = obj.getWhere();
         
         List<CBColumnData> whereRowCache = new ArrayList<N1QLUpdateVisitor.CBColumnData>();
-        List<Condition> conditions = findEqualityPredicates(where, whereRowCache);
+        findAllPredicates(where, whereRowCache);
         
         if(isArrayTable) {
-            if (!conditions.isEmpty()) {
-                throw new AssertionError();
-            }
             List<CBColumnData> rowCache = new ArrayList<N1QLUpdateVisitor.CBColumnData>();
             for (SetClause clause : obj.getChanges()) {
                 ColumnReference col = clause.getSymbol();
@@ -390,44 +425,66 @@ public class N1QLUpdateVisitor extends N1QLVisitor {
             buffer.append(SPACE);
             
             List<CBColumnData> idxList = new ArrayList<>(dimension);
+            List<CBColumnData> whereList = new ArrayList<>(whereRowCache.size());
             for(CBColumnData columnData : whereRowCache) {
                 if(columnData.getCBColumn().isIdx()) {
                     idxList.add(columnData);
                 } else if (!columnData.getCBColumn().isPK()) {
-                    throw new AssertionError();
+                    whereList.add(columnData);
                 }
             }
 
             String setKey = buildNestedArrayIdx(setAttr, dimension, idxList, obj) + LSBRACE + idxList.get(idxList.size() - 1).getValue() + RSBRACE;
-            buffer.append(SET).append(SPACE).append(setKey).append(SPACE).append(EQ).append(SPACE);
-            
-            JsonObject nestedObj = null;
+            buffer.append(SET);
+
+            boolean comma = false;
             for(CBColumnData columnData : setList) {
-                if(columnData.getCBColumn().hasLeaf()) {
-                    if(nestedObj == null) {
-                        nestedObj = JsonObject.create();
-                    }
-                    String attr = columnData.getCBColumn().getLeafName();
-                    String path = columnData.getCBColumn().getNameInSource();
-                    path = path.substring(path.lastIndexOf(SQUARE_BRACKETS) + SQUARE_BRACKETS.length() + SOURCE_SEPARATOR.length());
-                    JsonObject json = this.findObject(nestedObj, path);
-                    ef.setValue(json, attr, columnData.getColumnType(), columnData.getValue());
+                if(comma) {
+                    buffer.append(COMMA).append(SPACE);
+                } else {
+                    buffer.append(SPACE);
                 }
+                comma = true;
+                
+                String setRef = setKey;
+                if(columnData.getCBColumn().hasLeaf()) {
+                    String sourceName = columnData.getCBColumn().getNameInSource();
+                    setRef = setRef + sourceName.substring(sourceName.lastIndexOf(SQUARE_BRACKETS) + SQUARE_BRACKETS.length());
+                } 
+                buffer.append(setRef).append(SPACE).append(EQ).append(SPACE).append(getValueString(columnData.getColumnType(), columnData.getValue()));
             }
             
-            if(nestedObj != null) {
-                buffer.append(nestedObj);
-            } else {
-                buffer.append(getValueString(setList.get(0).getColumnType(), setList.get(0).getValue()));
+            List<String> andOrStack = getAndOrStack().subList(dimension, getAndOrStack().size());
+            
+            if(whereList.size() > 0) {
+                buffer.append(SPACE).append(WHERE);
+            }
+            boolean add = false;
+            for(int i = 0 ; i < whereList.size() ; i ++ ) {
+                CBColumnData columnData = whereList.get(i);
+                if(add) {
+                    buffer.append(andOrStack.get(i)).append(SPACE);
+                } else {
+                    buffer.append(SPACE);
+                }
+                add = true;
+                
+                String whereRef = setKey;
+                if(columnData.getCBColumn().hasLeaf()) {
+                    String sourceName = columnData.getCBColumn().getNameInSource();
+                    whereRef = whereRef + sourceName.substring(sourceName.lastIndexOf(SQUARE_BRACKETS) + SQUARE_BRACKETS.length());
+                } 
+                
+                buffer.append(whereRef).append(SPACE).append(columnData.getOperator()).append(SPACE).append(getValueString(columnData.getColumnType(), columnData.getValue()));
             }
             
         } else {
-            appendClauses(whereRowCache, conditions, obj.getChanges());
+            appendClauses(whereRowCache, obj.getChanges());
         }
         
         appendRetuning();
     }
-    
+
     private String getUsesKeyString(List<CBColumnData> rowCache) {
         CBColumnData pk = null;
         for(int i = 0 ; i < rowCache.size() ; i++) {
@@ -448,8 +505,9 @@ public class N1QLUpdateVisitor extends N1QLVisitor {
     }
     
     
-    private void appendClauses(List<CBColumnData> rowCache, List<Condition> otherConditions, List<SetClause> setClauses) {
-        if (rowCache.isEmpty() && otherConditions.isEmpty()) {
+    private void appendClauses(List<CBColumnData> rowCache, List<SetClause> setClauses) {
+        
+        if (rowCache.isEmpty()) {
             return;
         }
 
@@ -468,7 +526,8 @@ public class N1QLUpdateVisitor extends N1QLVisitor {
         }
         
         boolean hasPredicate = false;
-        for (CBColumnData columnData : rowCache) {
+        for (int i = 0 ; i < rowCache.size() ; i ++ ) {
+            CBColumnData columnData = rowCache.get(i);
             if(typedName != null && typedName.equals(nameInSource(columnData.getCBColumn().getLeafName()))) {
                 isTypedInProjection = true;
             }
@@ -488,16 +547,19 @@ public class N1QLUpdateVisitor extends N1QLVisitor {
             buffer.append(getValueString(columnData.getColumnType(), columnData.getValue()));
         }
         
-        if (!otherConditions.isEmpty()) {
-            if (!hasPredicate) {
-                buffer.append(SPACE).append(WHERE);
-                hasPredicate = true;
-            } else {
-                buffer.append(SPACE).append(AND);
-            }
-            buffer.append(SPACE);
-            append(LanguageUtil.combineCriteria(otherConditions));
-        }
+        //TODO -- replace this section
+        
+//        if (!otherConditions.isEmpty()) {
+//            if (!hasPredicate) {
+//                buffer.append(SPACE).append(WHERE);
+//                hasPredicate = true;
+//            } else {
+//                buffer.append(SPACE).append(AND);
+//            }
+//            buffer.append(SPACE).append(LPAREN);
+//            append(LanguageUtil.combineCriteria(otherConditions));
+//            buffer.append(RPAREN);
+//        }
         
         if(!isTypedInProjection && typedName != null && typedValue != null) {
             if (hasPredicate) {
@@ -514,6 +576,7 @@ public class N1QLUpdateVisitor extends N1QLVisitor {
         private Class<?> columnType;
         private CBColumn column;
         private Object value;
+        private String operator;
         
         private CBColumnData(Class<?> columnType, CBColumn column) {
             this.columnType = columnType;
@@ -536,5 +599,12 @@ public class N1QLUpdateVisitor extends N1QLVisitor {
             return this.column;
         }
 
+        public String getOperator() {
+            return operator;
+        }
+
+        public void setOperator(String operator) {
+            this.operator = operator;
+        }
     }
 }
